@@ -113,7 +113,7 @@ async fn run() -> Result<(),Error> {
         eprint!["{}", usage(&args)];
         std::process::exit(1);
       }
-      let mut ingest = Ingest::new(
+      let ingest = Ingest::new(
         LStore::new(open(std::path::Path::new(&ldb_dir.unwrap()))?),
         EStore::new(open_eyros(&std::path::Path::new(&edb_dir.unwrap())).await?)
       ).reporter(reporter);

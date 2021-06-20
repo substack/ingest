@@ -10,7 +10,14 @@ pub const BACKREF_PREFIX: u8 = 1;
 pub const REF_PREFIX: u8 = 2;
 
 use std::collections::{HashMap,HashSet};
-use async_std::{prelude::*,sync::{Arc,Mutex},io};
+use async_std::{
+  prelude::*,
+  sync::{Arc,Mutex},
+  io,
+  task::spawn,
+  channel::bounded
+};
+use futures::future::join_all;
 use desert::varint;
 
 use leveldb::iterator::{Iterable,LevelDBIterator};
@@ -38,6 +45,7 @@ impl ToString for Phase {
   }
 }
 
+#[derive(Clone)]
 pub struct Ingest {
   pub lstore: Arc<Mutex<LStore>>,
   pub estore: Arc<Mutex<EStore>>,
@@ -87,35 +95,78 @@ impl Ingest {
 
   // loop over the db, denormalize the records, georender-pack the data,
   // store into eyros, and write backrefs into leveldb
-  pub async fn process(&mut self) -> () {
+  pub async fn process(&self) -> () {
     let gt = Key::from(&vec![ID_PREFIX]);
     let lt = Key::from(&vec![ID_PREFIX,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff]);
-    let db = {
-      let lstore = self.lstore.lock().await;
-      lstore.db.clone()
-    };
-    let mut iter = {
-      let i = db.iter(ReadOptions::new());
-      i.seek(&gt);
-      i.take_while(move |(k,_)| *k < lt)
-    };
-    while let Some((key,value)) = iter.next() {
-      // presumably, if a feature doesn't have distinguishing tags,
-      // it could be referred to by other geometry, so skip it
-      // to save space in the final output
-      let res = match decode(&key.data,&value) {
-        Err(e) => Err(e.into()),
-        Ok(Decoded::Node(node)) => self.create_node(&node).await,
-        Ok(Decoded::Way(way)) => self.create_way(&way).await,
-        Ok(Decoded::Relation(relation)) => self.create_relation(&relation).await,
-      };
-      if let Some(f) = self.reporter.lock().await.as_mut() {
-        match res {
-          Err(e) => f(Phase::Process(), Err(e.into())),
-          Ok(r) => f(Phase::Process(), Ok(r)),
+
+    let (sender,receiver) = bounded::<(Key,Vec<u8>)>(100_000);
+    let nthreads: usize = 50;
+
+    let mut work = vec![];
+    work.push({
+      let reporter = self.reporter.clone();
+      let lstore = self.lstore.clone();
+      spawn(async move {
+        let batch_size = 10_000;
+        let mut gtx = gt.clone();
+        loop {
+          let batch = {
+            let db = {
+              let lstore = lstore.lock().await;
+              lstore.db.clone()
+            };
+            let mut iter = {
+              let i = db.iter(ReadOptions::new());
+              i.seek(&gtx.clone());
+              i.take_while(|(k,_)| k < &lt)
+            };
+            let mut batch = vec![];
+            while let Some((key,value)) = iter.next() {
+              gtx = key.clone();
+              batch.push((key,value));
+              if batch.len() >= batch_size { break }
+            }
+            batch
+          };
+          let batch_len = batch.len();
+          for kv in batch {
+            if let Err(e) = sender.send(kv).await {
+              if let Some(f) = reporter.lock().await.as_mut() {
+                f(Phase::Process(), Err(e.into()));
+              }
+            }
+          }
+          if batch_len < batch_size { break }
         }
-      }
+        sender.close();
+      })
+    });
+
+    for _ in 0..nthreads {
+      let this = self.clone();
+      let r = receiver.clone();
+      work.push(async_std::task::spawn(async move {
+        loop {
+          if r.is_closed() { break }
+          if let Ok((key,value)) = r.recv().await {
+            let res: Result<(),Error> = match decode(&key.data,&value) {
+              Err(e) => Err(e.into()),
+              Ok(Decoded::Node(node)) => this.create_node(&node).await,
+              Ok(Decoded::Way(way)) => this.create_way(&way).await,
+              Ok(Decoded::Relation(relation)) => this.create_relation(&relation).await,
+            };
+            if let Some(f) = this.reporter.lock().await.as_mut() {
+              match res {
+                Err(e) => f(Phase::Process(), Err(e.into())),
+                Ok(r) => f(Phase::Process(), Ok(r)),
+              }
+            }
+          }
+        }
+      }));
     }
+    join_all(work).await;
+
     {
       let optimize = 6;
       let mut estore = self.estore.lock().await;
