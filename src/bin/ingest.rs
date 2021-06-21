@@ -37,31 +37,29 @@ async fn run() -> Result<(),Error> {
   let mut phase_time = std::time::Instant::now();
   let mut last_print = std::time::Instant::now();
   let mut last_count: u64 = 0;
-  let reporter = Box::new(move |phase: Phase, res| {
-    if let Err(e) = res {
-      eprintln!["\n[{}] {} error: {}",
-        hms(start_time.elapsed().as_secs_f64() as u32), phase.to_string(), e];
-    } else {
+  let reporter = Box::new(move |phase: Phase, res: Result<(),Error>| {
+    if res.is_ok() {
       counter += 1;
-      if phase.is_complete() || last_print.elapsed().as_secs_f64() >= 1.0 {
-        let elapsed = start_time.elapsed().as_secs_f64() as u32;
-        let rate = {
-          if phase.is_complete() {
-            counter as f64 / phase_time.elapsed().as_secs_f64()
-          } else {
-            (counter-last_count) as f64 / last_print.elapsed().as_secs_f64()
-          }
-        };
-        eprint!["\x1b[1K\r[{}] {} {}: {:.0}/s{}", hms(elapsed), phase.to_string(), counter, rate,
-          if phase.is_complete() {
-            format![" [completed in {}]", hms(phase_time.elapsed().as_secs_f64() as u32)]
-          } else { "".to_string() }];
-        last_print = std::time::Instant::now();
-        last_count = counter;
-      }
-      if phase.is_complete() {
-        phase_time = std::time::Instant::now();
-      }
+    }
+    if phase.is_complete() || last_print.elapsed().as_secs_f64() >= 1.0 {
+      let elapsed = start_time.elapsed().as_secs_f64() as u32;
+      let rate = {
+        if phase.is_complete() {
+          counter as f64 / phase_time.elapsed().as_secs_f64()
+        } else {
+          (counter-last_count) as f64 / last_print.elapsed().as_secs_f64()
+        }
+      };
+      eprint!["\x1b[1K\r[{}] {} {}: {:.0}/s{}",
+        hms(elapsed), phase.to_string(), counter, rate,
+        if phase.is_complete() {
+          format![" [completed in {}]", hms(phase_time.elapsed().as_secs_f64() as u32)]
+        } else { "".to_string() }];
+      last_print = std::time::Instant::now();
+      last_count = counter;
+    }
+    if phase.is_complete() {
+      phase_time = std::time::Instant::now();
     }
   });
 

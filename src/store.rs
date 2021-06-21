@@ -17,6 +17,7 @@ pub type EDB = eyros::DB<S,T,P,V>;
 pub struct V {
   pub data: Vec<u8>,
 }
+
 impl Into<V> for Vec<u8> {
   fn into(self) -> V {
     V { data: self }

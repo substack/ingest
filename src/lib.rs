@@ -14,8 +14,8 @@ use async_std::{
   prelude::*,
   sync::{Arc,Mutex},
   io,
-  task::spawn,
-  channel::bounded
+  task::{spawn,spawn_local},
+  channel::{bounded,Sender,Receiver},
 };
 use futures::future::join_all;
 use desert::varint;
@@ -58,15 +58,20 @@ impl ToString for Phase {
 pub struct Ingest {
   pub lstore: Arc<Mutex<LStore>>,
   pub estore: Arc<Mutex<EStore>>,
+  estore_sender: Sender<(P,V)>,
+  estore_receiver: Receiver<(P,V)>,
   place_other: u64,
   reporter: Arc<Mutex<Option<Box<dyn FnMut(Phase, Result<(),Error>) -> ()+Send+Sync>>>>,
 }
 
 impl Ingest {
   pub fn new(lstore: LStore, estore: EStore) -> Self {
+    let (estore_sender,estore_receiver) = bounded(1_000_000);
     Self {
       lstore: Arc::new(Mutex::new(lstore)),
       estore: Arc::new(Mutex::new(estore)),
+      estore_sender,
+      estore_receiver,
       place_other: *georender_pack::osm_types::get_types().get("place.other").unwrap(),
       reporter: Arc::new(Mutex::new(None)),
     }
@@ -112,41 +117,56 @@ impl Ingest {
     let lt = Key::from(&vec![ID_PREFIX,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff]);
 
     let (sender,receiver) = bounded::<Vec<(Key,Vec<u8>)>>(1_000_000);
-    let nthreads: usize = 8;
+    let nthreads: usize = 50;
 
     let mut work = vec![];
+    {
+      let estore = self.estore.clone();
+      let r = self.estore_receiver.clone();
+      work.push(spawn_local(async move {
+        Self::estore_listener(estore, r).await;
+      }));
+    }
 
-    for _ in 0..nthreads {
-      let this = self.clone();
-      let r = receiver.clone();
-      work.push(async_std::task::spawn_local(async move {
-        loop {
-          if r.is_closed() { break }
-          if let Ok(kvs) = r.recv().await {
-            for (key,value) in kvs.iter() {
-              let res: Result<(),Error> = match decode(&key.data,&value) {
-                Err(e) => Err(e.into()),
-                Ok(Decoded::Node(node)) => this.create_node(&node).await,
-                Ok(Decoded::Way(way)) => this.create_way(&way).await,
-                Ok(Decoded::Relation(relation)) => this.create_relation(&relation).await,
-              };
-              if let Some(f) = this.reporter.lock().await.as_mut() {
-                match res {
-                  Err(e) => f(Phase::Process { complete: false }, Err(e.into())),
-                  Ok(r) => f(Phase::Process { complete: false }, Ok(r)),
+    {
+      let n_active = Arc::new(Mutex::new(nthreads));
+      for _ in 0..nthreads {
+        let this = self.clone();
+        let r = receiver.clone();
+        let n_m = n_active.clone();
+        let es = self.estore_sender.clone();
+        work.push(spawn(async move {
+          loop {
+            if r.is_closed() && r.is_empty() { break }
+            if let Ok(kvs) = r.recv().await {
+              for (key,value) in kvs.iter() {
+                let res: Result<(),Error> = match decode(&key.data,&value) {
+                  Err(e) => Err(e.into()),
+                  Ok(Decoded::Node(node)) => this.create_node(&node).await,
+                  Ok(Decoded::Way(way)) => this.create_way(&way).await,
+                  Ok(Decoded::Relation(relation)) => this.create_relation(&relation).await,
+                };
+                if let Some(f) = this.reporter.lock().await.as_mut() {
+                  match res {
+                    Err(e) => f(Phase::Process { complete: false }, Err(e.into())),
+                    Ok(r) => f(Phase::Process { complete: false }, Ok(r)),
+                  }
                 }
               }
             }
           }
-        }
-      }));
+          let mut n = n_m.lock().await;
+          *n -= 1;
+          if *n == 0 { es.close(); }
+        }));
+      }
     }
 
     work.push({
       let reporter = self.reporter.clone();
       let lstore = self.lstore.clone();
       spawn(async move {
-        let batch_size = 1000;
+        let batch_size = 10_000;
         let mut gtx = gt.clone();
         loop {
           let batch = {
@@ -179,6 +199,7 @@ impl Ingest {
         sender.close();
       })
     });
+
     join_all(work).await;
 
     {
@@ -441,6 +462,23 @@ impl Ingest {
     })
   }
 
+  async fn estore_listener(estore_m: Arc<Mutex<EStore>>, r: Receiver<(P,V)>) -> () {
+    let mut estore = estore_m.lock().await;
+    loop {
+      if r.is_closed() && r.is_empty() { break }
+      if let Ok((point,value)) = r.recv().await {
+        if let Err(e) = estore.create(point, value).await {}
+      }
+    }
+    estore.flush().await;
+    estore.sync().await;
+  }
+
+  async fn estore_create(&self, point: P, value: V) -> Result<(),Error> {
+    self.estore_sender.send((point, value)).await
+      .map_err(|e| e.into())
+  }
+
   fn encode_node(&self, node: &DecodedNode) -> Result<Option<(P,Vec<u8>)>,Error> {
     if node.feature_type == self.place_other { return Ok(None) }
     let encoded = georender_pack::encode::node_from_parsed(
@@ -453,8 +491,7 @@ impl Ingest {
 
   async fn create_node(&self, node: &DecodedNode) -> Result<(),Error> {
     if let Some((point,encoded)) = self.encode_node(node)? {
-      let mut estore = self.estore.lock().await;
-      estore.create(point, encoded.into()).await?;
+      self.estore_create(point, encoded.into()).await?;
     }
     Ok(())
   }
@@ -486,8 +523,7 @@ impl Ingest {
   async fn create_way(&self, way: &DecodedWay) -> Result<(),Error> {
     if let Some((point,deps,encoded)) = self.encode_way(way).await? {
       if way.feature_type != self.place_other {
-        let mut estore = self.estore.lock().await;
-        estore.create(point, encoded.into()).await?;
+        self.estore_create(point, encoded.into()).await?;
       }
       let mut lstore = self.lstore.lock().await;
       for r in deps.keys() {
@@ -501,8 +537,7 @@ impl Ingest {
   async fn create_relation(&self, relation: &DecodedRelation) -> Result<(),Error> {
     if let Some((point,deps,encoded)) = self.encode_relation(relation).await? {
       if relation.feature_type != self.place_other {
-        let mut estore = self.estore.lock().await;
-        estore.create(point, encoded.into()).await?;
+        self.estore_create(point, encoded.into()).await?;
       }
       let mut lstore = self.lstore.lock().await;
       for way_id in deps.keys() {
