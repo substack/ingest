@@ -30,17 +30,26 @@ type P = (eyros::Coord<f32>,eyros::Coord<f32>);
 
 #[derive(Debug,Clone,PartialEq)]
 pub enum Phase {
-  Pbf(),
-  Process(),
-  Changeset(),
+  Pbf { complete: bool },
+  Process { complete: bool },
+  Changeset { complete: bool },
+}
+impl Phase {
+  pub fn is_complete(&self) -> bool {
+    match self {
+      Self::Pbf { complete } => *complete,
+      Self::Process { complete } => *complete,
+      Self::Changeset { complete } => *complete,
+    }
+  }
 }
 
 impl ToString for Phase {
   fn to_string(&self) -> String {
     match self {
-      Phase::Pbf() => "pbf",
-      Phase::Process() => "process",
-      Phase::Changeset() => "changeset",
+      Phase::Pbf { .. } => "pbf",
+      Phase::Process { .. } => "process",
+      Phase::Changeset { .. } => "changeset",
     }.to_string()
   }
 }
@@ -75,13 +84,13 @@ impl Ingest {
     osmpbf::ElementReader::new(pbf).for_each(|element| {
       let res = encode_osmpbf(&element);
       match (res, reporter.as_mut()) {
-        (Err(e),Some(f)) => f(Phase::Pbf(),Err(e.into())),
+        (Err(e),Some(f)) => f(Phase::Pbf { complete: false }, Err(e.into())),
         (Err(_),_) => {},
         (Ok((key,value)),Some(f)) => {
           if let Err(e) = lstore.put(Key::from(&key), &value) {
-            f(Phase::Pbf(),Err(e.into()));
+            f(Phase::Pbf { complete: false }, Err(e.into()));
           } else {
-            f(Phase::Pbf(),Ok(()));
+            f(Phase::Pbf { complete: false }, Ok(()));
           }
         },
         (Ok((key,value)),None) => {
@@ -90,6 +99,9 @@ impl Ingest {
       }
     })?;
     lstore.flush()?;
+    if let Some(f) = reporter.as_mut() {
+      f(Phase::Pbf { complete: true }, Ok(()));
+    }
     Ok(())
   }
 
@@ -99,15 +111,42 @@ impl Ingest {
     let gt = Key::from(&vec![ID_PREFIX]);
     let lt = Key::from(&vec![ID_PREFIX,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff]);
 
-    let (sender,receiver) = bounded::<(Key,Vec<u8>)>(100_000);
-    let nthreads: usize = 50;
+    let (sender,receiver) = bounded::<Vec<(Key,Vec<u8>)>>(1_000_000);
+    let nthreads: usize = 8;
 
     let mut work = vec![];
+
+    for _ in 0..nthreads {
+      let this = self.clone();
+      let r = receiver.clone();
+      work.push(async_std::task::spawn_local(async move {
+        loop {
+          if r.is_closed() { break }
+          if let Ok(kvs) = r.recv().await {
+            for (key,value) in kvs.iter() {
+              let res: Result<(),Error> = match decode(&key.data,&value) {
+                Err(e) => Err(e.into()),
+                Ok(Decoded::Node(node)) => this.create_node(&node).await,
+                Ok(Decoded::Way(way)) => this.create_way(&way).await,
+                Ok(Decoded::Relation(relation)) => this.create_relation(&relation).await,
+              };
+              if let Some(f) = this.reporter.lock().await.as_mut() {
+                match res {
+                  Err(e) => f(Phase::Process { complete: false }, Err(e.into())),
+                  Ok(r) => f(Phase::Process { complete: false }, Ok(r)),
+                }
+              }
+            }
+          }
+        }
+      }));
+    }
+
     work.push({
       let reporter = self.reporter.clone();
       let lstore = self.lstore.clone();
       spawn(async move {
-        let batch_size = 10_000;
+        let batch_size = 1000;
         let mut gtx = gt.clone();
         loop {
           let batch = {
@@ -126,14 +165,13 @@ impl Ingest {
               batch.push((key,value));
               if batch.len() >= batch_size { break }
             }
+            gtx.increment();
             batch
           };
           let batch_len = batch.len();
-          for kv in batch {
-            if let Err(e) = sender.send(kv).await {
-              if let Some(f) = reporter.lock().await.as_mut() {
-                f(Phase::Process(), Err(e.into()));
-              }
+          if let Err(e) = sender.send(batch).await {
+            if let Some(f) = reporter.lock().await.as_mut() {
+              f(Phase::Process { complete: false }, Err(e.into()));
             }
           }
           if batch_len < batch_size { break }
@@ -141,30 +179,6 @@ impl Ingest {
         sender.close();
       })
     });
-
-    for _ in 0..nthreads {
-      let this = self.clone();
-      let r = receiver.clone();
-      work.push(async_std::task::spawn(async move {
-        loop {
-          if r.is_closed() { break }
-          if let Ok((key,value)) = r.recv().await {
-            let res: Result<(),Error> = match decode(&key.data,&value) {
-              Err(e) => Err(e.into()),
-              Ok(Decoded::Node(node)) => this.create_node(&node).await,
-              Ok(Decoded::Way(way)) => this.create_way(&way).await,
-              Ok(Decoded::Relation(relation)) => this.create_relation(&relation).await,
-            };
-            if let Some(f) = this.reporter.lock().await.as_mut() {
-              match res {
-                Err(e) => f(Phase::Process(), Err(e.into())),
-                Ok(r) => f(Phase::Process(), Ok(r)),
-              }
-            }
-          }
-        }
-      }));
-    }
     join_all(work).await;
 
     {
@@ -172,13 +186,13 @@ impl Ingest {
       let mut estore = self.estore.lock().await;
       if let Some(f) = self.reporter.lock().await.as_mut() {
         if let Err(e) = estore.optimize(optimize).await {
-          f(Phase::Process(), Err(e.into()));
+          f(Phase::Process { complete: false }, Err(e.into()));
         }
         if let Err(e) = estore.flush().await {
-          f(Phase::Process(), Err(e.into()));
+          f(Phase::Process { complete: false }, Err(e.into()));
         }
         if let Err(e) = estore.sync().await {
-          f(Phase::Process(), Err(e.into()));
+          f(Phase::Process { complete: false }, Err(e.into()));
         }
       } else {
         if let Err(_) = estore.optimize(optimize).await {}
@@ -190,8 +204,9 @@ impl Ingest {
       let mut lstore = self.lstore.lock().await;
       if let Some(f) = self.reporter.lock().await.as_mut() {
         if let Err(e) = lstore.flush() {
-          f(Phase::Process(), Err(e.into()));
+          f(Phase::Process { complete: false }, Err(e.into()));
         }
+        f(Phase::Process { complete: true }, Ok(()));
       } else {
         if let Err(_) = lstore.flush() {}
       }
@@ -290,6 +305,9 @@ impl Ingest {
     let mut estore = self.estore.lock().await;
     estore.flush().await?;
     estore.sync().await?;
+    if let Some(f) = self.reporter.lock().await.as_mut() {
+      f(Phase::Pbf { complete: true }, Ok(()));
+    }
     Ok(())
   }
 
@@ -539,7 +557,6 @@ impl Ingest {
   async fn get_way_deps(&self, iter: impl Iterator<Item=&u64>, deps: &mut NodeDeps) -> Result<(),Error> {
     let mut lstore = self.lstore.lock().await;
     let mut key_data = [ID_PREFIX,0,0,0,0,0,0,0,0];
-    key_data[0] = ID_PREFIX;
     let mut first = None;
     for r in iter {
       if first.is_none() {
@@ -565,7 +582,6 @@ impl Ingest {
     node_deps: &mut NodeDeps, way_deps: &mut WayDeps
   ) -> Result<(),Error> {
     let mut key_data = [ID_PREFIX,0,0,0,0,0,0,0,0];
-    key_data[0] = ID_PREFIX;
     for m in iter {
       key_data[1..].fill(0);
       let s = varint::encode(m*3+1,&mut key_data[1..])?;

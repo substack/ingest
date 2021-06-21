@@ -208,6 +208,19 @@ impl Key {
     Key { data: key.to_vec() }
   }
 }
+impl Key {
+  pub fn increment(&mut self) -> () {
+    self.data.resize(self.data.len().max(8), 0);
+    for i in (0..self.data.len()).rev() {
+      if self.data[i] == 255 {
+        self.data[i] = 0;
+      } else {
+        self.data[i] += 1;
+        break;
+      }
+    }
+  }
+}
 impl db_key::Key for Key {
   fn from_u8(key: &[u8]) -> Self { Key { data: key.into() } }
   fn as_slice<T, F: Fn(&[u8]) -> T>(&self, f: F) -> T { f(&self.data) }

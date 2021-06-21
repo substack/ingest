@@ -34,29 +34,35 @@ async fn run() -> Result<(),Error> {
 
   let mut counter: u64 = 0;
   let start_time = std::time::Instant::now();
+  let mut phase_time = std::time::Instant::now();
   let mut last_print = std::time::Instant::now();
-  let mut last_phase: Option<Phase> = None;
+  let mut last_count: u64 = 0;
   let reporter = Box::new(move |phase: Phase, res| {
     if let Err(e) = res {
-      eprintln!["\x1b[1K\r[{}] {} error: {}",
+      eprintln!["\n[{}] {} error: {}",
         hms(start_time.elapsed().as_secs_f64() as u32), phase.to_string(), e];
-      last_print = std::time::Instant::now();
     } else {
       counter += 1;
-      if last_phase.as_ref().and_then(|p| Some(p != &phase)).unwrap_or(false) {
-        eprintln!["\x1b[1K\r[{}] {} {}", hms(start_time.elapsed().as_secs_f64() as u32),
-          last_phase.as_ref().unwrap().to_string(), counter];
-        counter = 1;
-        eprint!["{} {}", phase.to_string(), counter];
-        last_print = std::time::Instant::now();
-      }
-      if last_print.elapsed().as_secs_f64() >= 1.0 {
+      if phase.is_complete() || last_print.elapsed().as_secs_f64() >= 1.0 {
         let elapsed = start_time.elapsed().as_secs_f64() as u32;
-        eprint!["\x1b[1K\r[{}] {} {}", hms(elapsed), phase.to_string(), counter];
+        let rate = {
+          if phase.is_complete() {
+            counter as f64 / phase_time.elapsed().as_secs_f64()
+          } else {
+            (counter-last_count) as f64 / last_print.elapsed().as_secs_f64()
+          }
+        };
+        eprint!["\x1b[1K\r[{}] {} {}: {:.0}/s{}", hms(elapsed), phase.to_string(), counter, rate,
+          if phase.is_complete() {
+            format![" [completed in {}]", hms(phase_time.elapsed().as_secs_f64() as u32)]
+          } else { "".to_string() }];
         last_print = std::time::Instant::now();
+        last_count = counter;
+      }
+      if phase.is_complete() {
+        phase_time = std::time::Instant::now();
       }
     }
-    last_phase = Some(phase);
   });
 
   match args.get(1).map(|x| x.as_str()) {
